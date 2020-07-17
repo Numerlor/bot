@@ -7,12 +7,12 @@ import textwrap
 from collections import OrderedDict
 from contextlib import suppress
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
+import typing as t
 from urllib.parse import urljoin
 
 import discord
 from bs4 import BeautifulSoup
-from bs4.element import PageElement, Tag
+from bs4.element import PageElement, Tag, SoupStrainer
 from discord.ext import commands
 from markdownify import MarkdownConverter
 from requests import ConnectTimeout, ConnectionError, HTTPError
@@ -68,7 +68,22 @@ FAILED_REQUEST_RETRY_AMOUNT = 3
 NOT_FOUND_DELETE_DELAY = RedirectOutput.delete_delay
 
 
-class DocItem(NamedTuple):
+class BS4FindManyMethod(t.Protocol):
+    bs4_filter = t.Union[str, t.Pattern, t.List["bs4_filter"], t.Literal[True]]
+    """Represent a find method from bs4 such as `find_all_next` that returns multiple `Tag`s."""
+    def __call__(
+            self,
+            instance: PageElement,
+            name: t.Optional[t.Union[bs4_filter, SoupStrainer]] = None,
+            attrs: t.Optional[t.Dict[str, t.Any]] = None,
+            text: t.Optional[bs4_filter] = None,
+            limit: t.Optional[int] = None,
+            **kwargs: bs4_filter,
+    ) -> t.Iterable[Tag]:
+        ...
+
+
+class DocItem(t.NamedTuple):
     """Holds inventory symbol information."""
 
     package: str
@@ -76,7 +91,7 @@ class DocItem(NamedTuple):
     group: str
 
 
-def async_cache(max_size: int = 128, arg_offset: int = 0) -> Callable:
+def async_cache(max_size: int = 128, arg_offset: int = 0) -> t.Callable:
     """
     LRU cache implementation for coroutines.
 
@@ -87,10 +102,10 @@ def async_cache(max_size: int = 128, arg_offset: int = 0) -> Callable:
     # Assign the cache to the function itself so we can clear it from outside.
     async_cache.cache = OrderedDict()
 
-    def decorator(function: Callable) -> Callable:
+    def decorator(function: t.Callable) -> t.Callable:
         """Define the async_cache decorator."""
         @functools.wraps(function)
-        async def wrapper(*args) -> Any:
+        async def wrapper(*args) -> t.Any:
             """Decorator wrapper for the caching logic."""
             key = ':'.join(args[arg_offset:])
 
@@ -177,7 +192,7 @@ class Doc(commands.Cog):
     def __init__(self, bot: Bot):
         self.base_urls = {}
         self.bot = bot
-        self.doc_symbols: Dict[str, DocItem] = {}
+        self.doc_symbols: t.Dict[str, DocItem] = {}
         self.renamed_symbols = set()
 
         self.bot.loop.create_task(self.init_refresh_inventory())
@@ -262,7 +277,7 @@ class Doc(commands.Cog):
         ]
         await asyncio.gather(*coros)
 
-    async def get_symbol_html(self, symbol: str) -> Optional[Tuple[list, str]]:
+    async def get_symbol_html(self, symbol: str) -> t.Optional[t.Tuple[list, str]]:
         """
         Given a Python symbol, return its signature and description.
 
@@ -292,12 +307,13 @@ class Doc(commands.Cog):
                 signatures, description = parsed_module
 
         else:
-            signatures, description = self.parse_symbol(symbol_heading, search_html)
+            signatures = self.get_signatures(symbol_heading)
+            description = "".join(map(str, self.find_next_children_until_tag(symbol_heading.find_next("dd"), ("dt", "dl"))))
 
         return signatures, description.replace('¶', '')
 
     @async_cache(arg_offset=1)
-    async def get_symbol_embed(self, symbol: str) -> Optional[discord.Embed]:
+    async def get_symbol_embed(self, symbol: str) -> t.Optional[discord.Embed]:
         """
         Attempt to scrape and fetch the data for the given `symbol`, and build an embed from its contents.
 
@@ -309,31 +325,9 @@ class Doc(commands.Cog):
 
         symbol_obj = self.doc_symbols[symbol]
         self.bot.stats.incr(f"doc_fetches.{symbol_obj.package.lower()}")
-        signatures = scraped_html[0]
+        signatures, html = scraped_html
         permalink = symbol_obj.url
-        description = markdownify(scraped_html[1], url=permalink)
-
-        # Truncate the description of the embed to the last occurrence
-        # of a double newline (interpreted as a paragraph) before index 1000.
-        if len(description) > 1000:
-            shortened = description[:1000]
-            description_cutoff = shortened.rfind('\n\n', 100)
-            if description_cutoff == -1:
-                # Search the shortened version for cutoff points in decreasing desirability,
-                # cutoff at 1000 if none are found.
-                for string in (". ", ", ", ",", " "):
-                    description_cutoff = shortened.rfind(string)
-                    if description_cutoff != -1:
-                        break
-                else:
-                    description_cutoff = 1000
-            description = description[:description_cutoff]
-
-            # If there is an incomplete code block, cut it out
-            if description.count("```") % 2:
-                codeblock_start = description.rfind('```py')
-                description = description[:codeblock_start].rstrip()
-            description += f"... [read more]({permalink})"
+        description = self.truncate_markdown(markdownify(html, url=permalink), max_length=1000, max_lines=15)
 
         description = WHITESPACE_AFTER_NEWLINES_RE.sub('', description)
         if signatures is None:
@@ -361,64 +355,63 @@ class Doc(commands.Cog):
         return embed
 
     @classmethod
-    def parse_module_symbol(cls, heading: PageElement) -> Optional[Tuple[None, str]]:
+    def get_description(cls, heading: PageElement) -> t.Optional[t.Tuple[None, str]]:
         """Get page content from the headerlink up to a table or a tag with its class in `SEARCH_END_TAG_ATTRS`."""
         start_tag = heading.find("a", attrs={"class": "headerlink"})
         if start_tag is None:
             return None
 
-        description = cls.find_all_children_until_tag(start_tag, cls._match_end_tag)
+        description = cls.find_next_children_until_tag(start_tag, cls._match_end_tag)
         if description is None:
             return None
 
         return None, description
 
     @classmethod
-    def parse_symbol(cls, heading: PageElement, html: str) -> Tuple[List[str], str]:
-        """
-        Parse the signatures and description of a symbol.
-
-        Collects up to 3 signatures from dt tags and a description from their sibling dd tag.
-        """
+    def get_signatures(cls, start_signature: PageElement) -> t.List[str]:
+        """Collect up to 3 signatures from dt tags around the `start_signature` dt tag."""
         signatures = []
-        description_element = heading.find_next_sibling("dd")
-        description_pos = html.find(str(description_element))
-        description = cls.find_all_children_until_tag(description_element, tag_filter=("dt", "dl"))
-
         for element in (
-            *reversed(heading.find_previous_siblings("dt", limit=2)),
-            heading,
-            *heading.find_next_siblings("dt", limit=2),
+            *reversed(cls.find_previous_siblings_until_tag(start_signature, ("dd",), limit=2)),
+            start_signature,
+            *cls.find_next_siblings_until_tag(start_signature, ("dd",), limit=2),
         )[-3:]:
-            signature = UNWANTED_SIGNATURE_SYMBOLS_RE.sub("", element.text)
+            signature = UNWANTED_SIGNATURE_SYMBOLS_RE.sub("", element.text if type(element) is not str else element)
 
-            if signature and html.find(str(element)) < description_pos:
+            if signature:
                 signatures.append(signature)
 
-        return signatures, description
+        return signatures
 
-    @staticmethod
-    def find_all_children_until_tag(
+    def find_elements_until_tag(
             start_element: PageElement,
-            tag_filter: Union[Tuple[str, ...], Callable[[Tag], bool]]
-    ) -> Optional[str]:
+            tag_filter: t.Union[t.Tuple[str, ...], t.Callable[[Tag], bool]],
+            *,
+            func: BS4FindManyMethod,
+            limit: int = None,
+    ) -> t.Optional[str]:
         """
-        Get all direct children until a child matching `tag_filter` is found.
+        Get all tags from a bs4 find many method until a tag matching `tag_filter` is found.
 
         `tag_filter` can be either a tuple of string names to check against,
-        or a filtering callable that's applied to the tags.
+        or a filtering t.Callable that's applied to the tags.
         """
-        text = ""
-
-        for element in start_element.find_next().find_next_siblings():
+        elements = []
+        for element in func(start_element, limit=limit):
             if isinstance(tag_filter, tuple):
                 if element.name in tag_filter:
                     break
             elif tag_filter(element):
                 break
-            text += str(element)
+            elements.append(element)
 
-        return text
+        return elements
+
+    find_next_children_until_tag = staticmethod(functools.partial(find_elements_until_tag, func=functools.partial(BeautifulSoup.find_all, recursive=False)))
+    find_previous_children_until_tag = staticmethod(functools.partial(find_elements_until_tag, func=BeautifulSoup.find_all_previous))
+    find_next_siblings_until_tag = staticmethod(functools.partial(find_elements_until_tag, func=BeautifulSoup.find_next_siblings))
+    find_previous_siblings_until_tag = staticmethod(functools.partial(find_elements_until_tag, func=BeautifulSoup.find_previous_siblings))
+    find_elements_until_tag = staticmethod(find_elements_until_tag)
 
     @async_cache(arg_offset=1)
     async def _get_soup_from_url(self, url: str) -> BeautifulSoup:
@@ -430,12 +423,12 @@ class Doc(commands.Cog):
         return soup
 
     @commands.group(name='docs', aliases=('doc', 'd'), invoke_without_command=True)
-    async def docs_group(self, ctx: commands.Context, *, symbol: Optional[str]) -> None:
+    async def docs_group(self, ctx: commands.Context, *, symbol: t.Optional[str]) -> None:
         """Lookup documentation for Python symbols."""
         await ctx.invoke(self.get_command, symbol=symbol)
 
     @docs_group.command(name='getdoc', aliases=('g',))
-    async def get_command(self, ctx: commands.Context, *, symbol: Optional[str]) -> None:
+    async def get_command(self, ctx: commands.Context, *, symbol: t.Optional[str]) -> None:
         """
         Return a documentation embed for a given symbol.
 
@@ -561,7 +554,7 @@ class Doc(commands.Cog):
         )
         await ctx.send(embed=embed)
 
-    async def _fetch_inventory(self, inventory_url: str) -> Optional[dict]:
+    async def _fetch_inventory(self, inventory_url: str) -> t.Optional[dict]:
         """Get and return inventory from `inventory_url`. If fetching fails, return None."""
         fetch_func = functools.partial(intersphinx.fetch_inventory, SPHINX_MOCK_APP, '', inventory_url)
         for retry in range(1, FAILED_REQUEST_RETRY_AMOUNT+1):

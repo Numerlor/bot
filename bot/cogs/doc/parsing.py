@@ -89,9 +89,9 @@ def _get_general_description(start_element: PageElement) -> Optional[str]:
     """
     header = start_element.find_next("a", attrs={"class": "headerlink"})
     start_tag = header.parent if header is not None else start_element
-    description = "".join(
-        str(tag) for tag in _find_next_siblings_until_tag(start_tag, _match_end_tag, include_strings=True)
-    )
+    result_tags = _find_next_siblings_until_tag(start_tag, _match_end_tag, include_strings=True)
+    description = "".join(str(tag) for tag in result_tags)
+
 
     return description
 
@@ -100,7 +100,9 @@ def _get_dd_description(symbol: PageElement) -> str:
     """Get the string contents of the next dd tag, up to a dt or a dl tag."""
     description_tag = symbol.find_next("dd")
     description_contents = _find_next_children_until_tag(description_tag, ("dt", "dl"), include_strings=True)
-    return "".join(str(tag) for tag in description_contents)
+    description = "".join(str(tag) for tag in description_contents)
+
+    return description
 
 
 def _get_signatures(start_signature: PageElement) -> List[str]:
@@ -190,45 +192,38 @@ def _match_end_tag(tag: Tag) -> bool:
     return tag.name == "table"
 
 
-async def get_symbol_markdown(http_session: ClientSession, symbol_data: "DocItem") -> str:
+def get_symbol_markdown(soup: BeautifulSoup, symbol_data: "DocItem") -> str:
     """
     Return parsed markdown of the passed symbol, truncated to 1000 characters.
 
     A request through `http_session` is made to the url associated with `symbol_data` for the html contents;
     the contents are then parsed depending on what group the symbol belongs to.
     """
-    log.trace(f"Parsing symbol from url {symbol_data.url}.")
-    if "#" in symbol_data.url:
-        request_url, symbol_id = symbol_data.url.rsplit('#')
-    else:
-        request_url = symbol_data.url
-        symbol_id = None
-
-    soup = await _get_soup_from_url(http_session, request_url)
-    symbol_heading = soup.find(id=symbol_id)
+    # log.trace(f"Parsing symbol from url {symbol_data.url}.")
+    symbol_heading = soup.find(id=symbol_data.symbol_id)
     signature = None
     # Modules, doc pages and labels don't point to description list tags but to tags like divs,
     # no special parsing can be done so we only try to include what's under them.
     if symbol_data.group in {"module", "doc", "label"}:
-        log.trace("Symbol is a module, doc or a label; using general description parsing.")
+        # log.trace("Symbol is a module, doc or a label; using general description parsing.")
         description = _get_general_description(symbol_heading)
 
     elif symbol_heading.name != "dt":
         # Use the general parsing for symbols that aren't modules, docs or labels and aren't dt tags,
         # log info the tag can be looked at.
-        log.info(
-            f"Symbol heading at url {symbol_data.url} was not a dt tag or from known groups that lack it,"
-            f"handling as general description."
-        )
+        # log.info(
+        #     f"Symbol heading at url {symbol_data.url} was not a dt tag or from known groups that lack it,"
+        #     f"handling as general description."
+        # )
         description = _get_general_description(symbol_heading)
 
     elif symbol_data.group in _NO_SIGNATURE_GROUPS:
-        log.trace("Symbol's group is in the group signature blacklist, skipping parsing of signature.")
+        # log.trace("Symbol's group is in the group signature blacklist, skipping parsing of signature.")
         description = _get_dd_description(symbol_heading)
 
     else:
-        log.trace("Parsing both signature and description of symbol.")
-        signature = _get_signatures(symbol_heading)
+        # log.trace("Parsing both signature and description of symbol.")
         description = _get_dd_description(symbol_heading)
+        signature = _get_signatures(symbol_heading)
 
     return _parse_into_markdown(signature, description.replace('¶', ''), symbol_data.url)

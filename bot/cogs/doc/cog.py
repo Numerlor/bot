@@ -3,12 +3,13 @@ import functools
 import logging
 import re
 import sys
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from contextlib import suppress
 from types import SimpleNamespace
-from typing import Dict, NamedTuple, Optional
+from typing import Dict, NamedTuple, Optional, List
 
 import discord
+from bs4 import BeautifulSoup
 from discord.ext import commands
 from requests import ConnectTimeout, ConnectionError, HTTPError
 from sphinx.ext import intersphinx
@@ -52,18 +53,83 @@ FAILED_REQUEST_RETRY_AMOUNT = 3
 NOT_FOUND_DELETE_DELAY = RedirectOutput.delete_delay
 
 
+class TODO_PLACEHOLDER:
+    __slots__ = ("queue", "item_events", "started", "fetch_lock")
+    results_dict: Dict[str, discord.Embed] = None
+
+    def __init__(self):
+        self.queue: List[DocItem] = list()
+        self.fetch_lock = asyncio.Lock()
+        self.started = False
+        self.item_events: Dict[DocItem, asyncio.Event] = {}
+
+    @classmethod
+    def set_results_dict(cls, results_dict: Dict[str, discord.Embed]):
+        """
+        Set dict for parse results for all instances.
+
+        Must be set before any parsing is attempted.
+        """
+        cls.results_dict = results_dict
+
+    def add_item(self, item):
+        """Add `item` into the parse queue."""
+        self.queue.append(item)
+
+    def put_to_front(self, item):
+        """Move `item` to the front of the parse queue."""
+        self.queue.remove(item)
+        self.queue.append(item)
+
+    async def wait_for_item(self, symbol_info, soup: Optional[BeautifulSoup] = None):
+        """
+        Block until `symbol_info` is parsed and assigned to `cls.results_dict`.
+
+        When not started, `soup` must be provided to start the parsing task;
+        after the initial request, providing the soup is unnecessary.
+        """
+        self.put_to_front(symbol_info)
+        item_event = asyncio.Event()
+        # First request
+        if not self.item_events:
+            log.info(f"Started {symbol_info.base_url + symbol_info.relative_url_path}")
+            self.item_events[symbol_info] = item_event
+            asyncio.create_task(self.parse_items(soup))
+        else:
+            self.item_events[symbol_info] = item_event
+        await item_event.wait()
+
+    async def parse_items(self, soup):
+        """Parse all item from `soup` and assign their result embeds into `cls.results_dict`."""
+        while self.queue:
+            item = self.queue.pop()
+            embed = discord.Embed(
+                title=discord.utils.escape_markdown(item.name),
+                url=item.url,
+                description=get_symbol_markdown(soup, item)
+            )
+            self.results_dict[item.name] = embed
+            event = self.item_events.get(item)
+            if event is not None:
+                event.set()
+            await asyncio.sleep(0.1)
+        log.info(f"finished {item.base_url + item.relative_url_path}")
+
+
 class DocItem(NamedTuple):
     """Holds inventory symbol information."""
 
-    base_url: str
-    relative_url: str
+    name: str
     package: str
     group: str
+    base_url: str
+    relative_url_path: str
+    symbol_id: str
 
     @property
     def url(self) -> str:
         """Return the absolute url to the symbol."""
-        return self.base_url + self.relative_url
+        return "".join((self.base_url, self.relative_url_path, "#", self.symbol_id))
 
 
 class InventoryURL(commands.Converter):
@@ -106,8 +172,11 @@ class DocCog(commands.Cog):
         self.bot = bot
         self.doc_symbols: Dict[str, DocItem] = {}
         self.renamed_symbols = set()
-
+        self.urls: Dict[str, TODO_PLACEHOLDER] = defaultdict(TODO_PLACEHOLDER)
+        self.objects = {}
         self.bot.loop.create_task(self.init_refresh_inventory())
+        TODO_PLACEHOLDER.set_results_dict(self.objects)
+        # TODO decide on objects/doc_symbols merging and what needs to be kept in doc_symbols when urls exist
 
     async def init_refresh_inventory(self) -> None:
         """Refresh documentation inventory on cog initialization."""
@@ -163,8 +232,10 @@ class DocCog(commands.Cog):
                         # Split `package_name` because of packages like Pillow that have spaces in them.
                         symbol = f"{api_package_name}.{symbol}"
                         self.renamed_symbols.add(symbol)
-
-                self.doc_symbols[symbol] = DocItem(base_url, relative_doc_url, api_package_name, group_name)
+                # TODO remove comment above, clean up
+                relative_url_path, _, symbol_id = relative_doc_url.partition("#")
+                self.doc_symbols[symbol] = DocItem(symbol, api_package_name,group_name, base_url, relative_url_path, symbol_id)
+                self.urls[base_url+relative_url_path].add_item(self.doc_symbols[symbol])
 
         log.trace(f"Fetched inventory for {api_package_name}.")
 
@@ -189,6 +260,19 @@ class DocCog(commands.Cog):
         ]
         await asyncio.gather(*coros)
 
+    async def get_symbol_markdown(self, symbol_data: DocItem):
+        """TODO"""
+        if symbol_data.name not in self.objects:
+            q = self.urls[symbol_data.base_url + symbol_data.relative_url_path]
+            if not q.started:
+                async with self.bot.http_session.get(symbol_data.url) as response:
+                    soup = BeautifulSoup(await response.text(encoding="utf8"), 'lxml')
+                    soup.find("head").decompose()
+            else:
+                soup = None
+            await q.wait_for_item(symbol_data, soup)
+        return self.objects[symbol_data.name]
+
     async def get_symbol_embed(self, symbol: str) -> Optional[discord.Embed]:
         """
         Attempt to scrape and fetch the data for the given `symbol`, and build an embed from its contents.
@@ -198,14 +282,9 @@ class DocCog(commands.Cog):
         symbol_info = self.doc_symbols.get(symbol)
         if symbol_info is None:
             return None
-        self.bot.stats.incr(f"doc_fetches.{symbol_info.package.lower()}")
-        embed_description = await get_symbol_markdown(self.bot.http_session, symbol_info)
 
-        embed = discord.Embed(
-            title=discord.utils.escape_markdown(symbol),
-            url=symbol_info.url,
-            description=embed_description
-        )
+        self.bot.stats.incr(f"doc_fetches.{symbol_info.package.lower()}")
+        embed = await self.get_symbol_markdown(symbol_info)
         # Show all symbols with the same name that were renamed in the footer.
         embed.set_footer(
             text=", ".join(renamed for renamed in self.renamed_symbols - {symbol} if renamed.endswith(f".{symbol}"))
@@ -216,6 +295,11 @@ class DocCog(commands.Cog):
     async def docs_group(self, ctx: commands.Context, *, symbol: Optional[str]) -> None:
         """Lookup documentation for Python symbols."""
         await ctx.invoke(self.get_command, symbol=symbol)
+
+    @commands.command()
+    async def command(self, ctx):
+        for symbol in ["arcade", "arcade"]:
+                               await self.get_command(ctx, symbol=symbol)
 
     @docs_group.command(name='getdoc', aliases=('g',))
     async def get_command(self, ctx: commands.Context, *, symbol: Optional[str]) -> None:

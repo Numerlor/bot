@@ -1,15 +1,25 @@
 from urllib.parse import urljoin
 
+from bs4 import BeautifulSoup
 from bs4.element import PageElement
 from markdownify import MarkdownConverter
 
-
+FRAGMENT_ID = '__MARKDOWNIFY_WRAPPER__'
+wrapped = '<div id="%s">%%s</div>' % FRAGMENT_ID
 class _DocMarkdownConverter(MarkdownConverter):
     """Subclass markdownify's MarkdownCoverter to provide custom conversion methods."""
 
     def __init__(self, *, page_url: str, **options):
         super().__init__(**options)
         self.page_url = page_url
+
+    def convert(self, html):
+        # We want to take advantage of the html5 parsing, but we don't actually
+        # want a full document. Therefore, we'll mark our fragment with an id,
+        # create the document, and extract the element with the id.
+        html = wrapped % html
+        soup = BeautifulSoup(html, 'lxml')
+        return self.process_tag(soup.find(id=FRAGMENT_ID), children_only=True)
 
     def convert_li(self, el: PageElement, text: str) -> str:
         """Fix markdownify's erroneous indexing in ol tags."""

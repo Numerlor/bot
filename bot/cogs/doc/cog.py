@@ -3,18 +3,14 @@ import functools
 import logging
 import re
 import sys
-import textwrap
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from contextlib import suppress
 from types import SimpleNamespace
-import typing as t
-from urllib.parse import urljoin
+from typing import Dict, NamedTuple, Optional, List
 
 import discord
 from bs4 import BeautifulSoup
-from bs4.element import PageElement, Tag, SoupStrainer
 from discord.ext import commands
-from markdownify import MarkdownConverter
 from requests import ConnectTimeout, ConnectionError, HTTPError
 from sphinx.ext import intersphinx
 from urllib3.exceptions import ProtocolError
@@ -25,7 +21,8 @@ from bot.converters import PackageName, ValidURL
 from bot.decorators import with_role
 from bot.pagination import LinePaginator
 from bot.utils.messages import wait_for_deletion
-
+from .cache import async_cache
+from .parsing import get_symbol_markdown
 
 log = logging.getLogger(__name__)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
@@ -51,107 +48,88 @@ NO_OVERRIDE_PACKAGES = (
     "python",
 )
 
-SEARCH_END_TAG_ATTRS = (
-    "data",
-    "function",
-    "class",
-    "exception",
-    "seealso",
-    "section",
-    "rubric",
-    "sphinxsidebar",
-)
-UNWANTED_SIGNATURE_SYMBOLS_RE = re.compile(r"\[source]|\\\\|¶")
 WHITESPACE_AFTER_NEWLINES_RE = re.compile(r"(?<=\n\n)(\s+)")
-
 FAILED_REQUEST_RETRY_AMOUNT = 3
 NOT_FOUND_DELETE_DELAY = RedirectOutput.delete_delay
 
 
-class BS4FindManyMethod(t.Protocol):
-    bs4_filter = t.Union[str, t.Pattern, t.List["bs4_filter"], t.Literal[True]]
-    """Represent a find method from bs4 such as `find_all_next` that returns multiple `Tag`s."""
-    def __call__(
-            self,
-            instance: PageElement,
-            name: t.Optional[t.Union[bs4_filter, SoupStrainer]] = None,
-            attrs: t.Optional[t.Dict[str, t.Any]] = None,
-            text: t.Optional[bs4_filter] = None,
-            limit: t.Optional[int] = None,
-            **kwargs: bs4_filter,
-    ) -> t.Iterable[Tag]:
-        ...
+class TODO_PLACEHOLDER:
+    __slots__ = ("queue", "item_events", "started", "fetch_lock")
+    results_dict: Dict[str, discord.Embed] = None
+
+    def __init__(self):
+        self.queue: List[DocItem] = list()
+        self.fetch_lock = asyncio.Lock()
+        self.started = False
+        self.item_events: Dict[DocItem, asyncio.Event] = {}
+
+    @classmethod
+    def set_results_dict(cls, results_dict: Dict[str, discord.Embed]):
+        """
+        Set dict for parse results for all instances.
+
+        Must be set before any parsing is attempted.
+        """
+        cls.results_dict = results_dict
+
+    def add_item(self, item):
+        """Add `item` into the parse queue."""
+        self.queue.append(item)
+
+    def put_to_front(self, item):
+        """Move `item` to the front of the parse queue."""
+        self.queue.remove(item)
+        self.queue.append(item)
+
+    async def wait_for_item(self, symbol_info, soup: Optional[BeautifulSoup] = None):
+        """
+        Block until `symbol_info` is parsed and assigned to `cls.results_dict`.
+
+        When not started, `soup` must be provided to start the parsing task;
+        after the initial request, providing the soup is unnecessary.
+        """
+        self.put_to_front(symbol_info)
+        item_event = asyncio.Event()
+        # First request
+        if not self.item_events:
+            log.info(f"Started {symbol_info.base_url + symbol_info.relative_url_path}")
+            self.item_events[symbol_info] = item_event
+            asyncio.create_task(self.parse_items(soup))
+        else:
+            self.item_events[symbol_info] = item_event
+        await item_event.wait()
+
+    async def parse_items(self, soup):
+        """Parse all item from `soup` and assign their result embeds into `cls.results_dict`."""
+        while self.queue:
+            item = self.queue.pop()
+            embed = discord.Embed(
+                title=discord.utils.escape_markdown(item.name),
+                url=item.url,
+                description=get_symbol_markdown(soup, item)
+            )
+            self.results_dict[item.name] = embed
+            event = self.item_events.get(item)
+            if event is not None:
+                event.set()
+            await asyncio.sleep(0.1)
+        log.info(f"finished {item.base_url + item.relative_url_path}")
 
 
-class DocItem(t.NamedTuple):
+class DocItem(NamedTuple):
     """Holds inventory symbol information."""
 
+    name: str
     package: str
-    url: str
     group: str
+    base_url: str
+    relative_url_path: str
+    symbol_id: str
 
-
-def async_cache(max_size: int = 128, arg_offset: int = 0) -> t.Callable:
-    """
-    LRU cache implementation for coroutines.
-
-    Once the cache exceeds the maximum size, keys are deleted in FIFO order.
-
-    An offset may be optionally provided to be applied to the coroutine's arguments when creating the cache key.
-    """
-    # Assign the cache to the function itself so we can clear it from outside.
-    async_cache.cache = OrderedDict()
-
-    def decorator(function: t.Callable) -> t.Callable:
-        """Define the async_cache decorator."""
-        @functools.wraps(function)
-        async def wrapper(*args) -> t.Any:
-            """Decorator wrapper for the caching logic."""
-            key = ':'.join(args[arg_offset:])
-
-            value = async_cache.cache.get(key)
-            if value is None:
-                if len(async_cache.cache) > max_size:
-                    async_cache.cache.popitem(last=False)
-
-                async_cache.cache[key] = await function(*args)
-            return async_cache.cache[key]
-        return wrapper
-    return decorator
-
-
-class DocMarkdownConverter(MarkdownConverter):
-    """Subclass markdownify's MarkdownCoverter to provide custom conversion methods."""
-
-    def __init__(self, *, page_url: str, **options):
-        super().__init__(**options)
-        self.page_url = page_url
-
-    def convert_code(self, el: PageElement, text: str) -> str:
-        """Undo `markdownify`s underscore escaping."""
-        return f"`{text}`".replace('\\', '')
-
-    def convert_pre(self, el: PageElement, text: str) -> str:
-        """Wrap any codeblocks in `py` for syntax highlighting."""
-        code = ''.join(el.strings)
-        return f"```py\n{code}```"
-
-    def convert_a(self, el: PageElement, text: str) -> str:
-        """Resolve relative URLs to `self.page_url`."""
-        el["href"] = urljoin(self.page_url, el["href"])
-        return super().convert_a(el, text)
-
-    def convert_p(self, el: PageElement, text: str) -> str:
-        """Include only one newline instead of two when the parent is a li tag."""
-        parent = el.parent
-        if parent is not None and parent.name == "li":
-            return f"{text}\n"
-        return super().convert_p(el, text)
-
-
-def markdownify(html: str, *, url: str = "") -> str:
-    """Create a DocMarkdownConverter object from the input html."""
-    return DocMarkdownConverter(bullets='•', page_url=url).convert(html)
+    @property
+    def url(self) -> str:
+        """Return the absolute url to the symbol."""
+        return "".join((self.base_url, self.relative_url_path, "#", self.symbol_id))
 
 
 class InventoryURL(commands.Converter):
@@ -186,16 +164,19 @@ class InventoryURL(commands.Converter):
         return url
 
 
-class Doc(commands.Cog):
+class DocCog(commands.Cog):
     """A set of commands for querying & displaying documentation."""
 
     def __init__(self, bot: Bot):
         self.base_urls = {}
         self.bot = bot
-        self.doc_symbols: t.Dict[str, DocItem] = {}
+        self.doc_symbols: Dict[str, DocItem] = {}
         self.renamed_symbols = set()
-
+        self.urls: Dict[str, TODO_PLACEHOLDER] = defaultdict(TODO_PLACEHOLDER)
+        self.objects = {}
         self.bot.loop.create_task(self.init_refresh_inventory())
+        TODO_PLACEHOLDER.set_results_dict(self.objects)
+        # TODO decide on objects/doc_symbols merging and what needs to be kept in doc_symbols when urls exist
 
     async def init_refresh_inventory(self) -> None:
         """Refresh documentation inventory on cog initialization."""
@@ -225,7 +206,6 @@ class Doc(commands.Cog):
             for symbol, (_package_name, _version, relative_doc_url, _) in value.items():
                 if "/" in symbol:
                     continue  # skip unreachable symbols with slashes
-                absolute_doc_url = base_url + relative_doc_url
                 # Intern the group names since they're reused in all the DocItems
                 # to remove unnecessary memory consumption from them being unique objects
                 group_name = sys.intern(group.split(":")[1])
@@ -237,6 +217,7 @@ class Doc(commands.Cog):
                         or any(package in symbol_base_url for package in NO_OVERRIDE_PACKAGES)
                     ):
                         symbol = f"{group_name}.{symbol}"
+                        self.renamed_symbols.add(symbol)
 
                     elif (overridden_symbol_group := self.doc_symbols[symbol].group) in NO_OVERRIDE_GROUPS:
                         overridden_symbol = f"{overridden_symbol_group}.{symbol}"
@@ -247,12 +228,14 @@ class Doc(commands.Cog):
                         self.renamed_symbols.add(overridden_symbol)
 
                     # If renamed `symbol` already exists, add library name in front to differentiate between them.
-                    if symbol in self.renamed_symbols:
+                    elif symbol in self.renamed_symbols:
                         # Split `package_name` because of packages like Pillow that have spaces in them.
                         symbol = f"{api_package_name}.{symbol}"
                         self.renamed_symbols.add(symbol)
-
-                self.doc_symbols[symbol] = DocItem(api_package_name, absolute_doc_url, group_name)
+                # TODO remove comment above, clean up
+                relative_url_path, _, symbol_id = relative_doc_url.partition("#")
+                self.doc_symbols[symbol] = DocItem(symbol, api_package_name,group_name, base_url, relative_url_path, symbol_id)
+                self.urls[base_url+relative_url_path].add_item(self.doc_symbols[symbol])
 
         log.trace(f"Fetched inventory for {api_package_name}.")
 
@@ -277,158 +260,49 @@ class Doc(commands.Cog):
         ]
         await asyncio.gather(*coros)
 
-    async def get_symbol_html(self, symbol: str) -> t.Optional[t.Tuple[list, str]]:
-        """
-        Given a Python symbol, return its signature and description.
-
-        The first tuple element is the signature of the given symbol as a markup-free string, and
-        the second tuple element is the description of the given symbol with HTML markup included.
-
-        If the given symbol is a module, returns a tuple `(None, str)`
-        else if the symbol could not be found, returns `None`.
-        """
-        symbol_info = self.doc_symbols.get(symbol)
-        if symbol_info is None:
-            return None
-        request_url, symbol_id = symbol_info.url.rsplit('#')
-
-        soup = await self._get_soup_from_url(request_url)
-        symbol_heading = soup.find(id=symbol_id)
-        search_html = str(soup)
-
-        if symbol_heading is None:
-            return None
-
-        if symbol_info.group == "module":
-            parsed_module = self.parse_module_symbol(symbol_heading)
-            if parsed_module is None:
-                return [], ""
+    async def get_symbol_markdown(self, symbol_data: DocItem):
+        """TODO"""
+        if symbol_data.name not in self.objects:
+            q = self.urls[symbol_data.base_url + symbol_data.relative_url_path]
+            if not q.started:
+                async with self.bot.http_session.get(symbol_data.url) as response:
+                    soup = BeautifulSoup(await response.text(encoding="utf8"), 'lxml')
+                    soup.find("head").decompose()
             else:
-                signatures, description = parsed_module
+                soup = None
+            await q.wait_for_item(symbol_data, soup)
+        return self.objects[symbol_data.name]
 
-        else:
-            signatures = self.get_signatures(symbol_heading)
-            description = "".join(map(str, self.find_next_children_until_tag(symbol_heading.find_next("dd"), ("dt", "dl"))))
-
-        return signatures, description.replace('¶', '')
-
-    @async_cache(arg_offset=1)
-    async def get_symbol_embed(self, symbol: str) -> t.Optional[discord.Embed]:
+    async def get_symbol_embed(self, symbol: str) -> Optional[discord.Embed]:
         """
         Attempt to scrape and fetch the data for the given `symbol`, and build an embed from its contents.
 
         If the symbol is known, an Embed with documentation about it is returned.
         """
-        scraped_html = await self.get_symbol_html(symbol)
-        if scraped_html is None:
+        symbol_info = self.doc_symbols.get(symbol)
+        if symbol_info is None:
             return None
 
-        symbol_obj = self.doc_symbols[symbol]
-        self.bot.stats.incr(f"doc_fetches.{symbol_obj.package.lower()}")
-        signatures, html = scraped_html
-        permalink = symbol_obj.url
-        description = self.truncate_markdown(markdownify(html, url=permalink), max_length=1000, max_lines=15)
-
-        description = WHITESPACE_AFTER_NEWLINES_RE.sub('', description)
-        if signatures is None:
-            # If symbol is a module, don't show signature.
-            embed_description = description
-
-        elif not signatures:
-            # It's some "meta-page", for example:
-            # https://docs.djangoproject.com/en/dev/ref/views/#module-django.views
-            embed_description = "This appears to be a generic page not tied to a specific symbol."
-
-        else:
-            embed_description = "".join(f"```py\n{textwrap.shorten(signature, 500)}```" for signature in signatures)
-            embed_description += f"\n{description}"
-
-        embed = discord.Embed(
-            title=discord.utils.escape_markdown(symbol),
-            url=permalink,
-            description=embed_description
-        )
+        self.bot.stats.incr(f"doc_fetches.{symbol_info.package.lower()}")
+        embed = await self.get_symbol_markdown(symbol_info)
         # Show all symbols with the same name that were renamed in the footer.
         embed.set_footer(
             text=", ".join(renamed for renamed in self.renamed_symbols - {symbol} if renamed.endswith(f".{symbol}"))
         )
         return embed
 
-    @classmethod
-    def get_description(cls, heading: PageElement) -> t.Optional[t.Tuple[None, str]]:
-        """Get page content from the headerlink up to a table or a tag with its class in `SEARCH_END_TAG_ATTRS`."""
-        start_tag = heading.find("a", attrs={"class": "headerlink"})
-        if start_tag is None:
-            return None
-
-        description = cls.find_next_children_until_tag(start_tag, cls._match_end_tag)
-        if description is None:
-            return None
-
-        return None, description
-
-    @classmethod
-    def get_signatures(cls, start_signature: PageElement) -> t.List[str]:
-        """Collect up to 3 signatures from dt tags around the `start_signature` dt tag."""
-        signatures = []
-        for element in (
-            *reversed(cls.find_previous_siblings_until_tag(start_signature, ("dd",), limit=2)),
-            start_signature,
-            *cls.find_next_siblings_until_tag(start_signature, ("dd",), limit=2),
-        )[-3:]:
-            signature = UNWANTED_SIGNATURE_SYMBOLS_RE.sub("", element.text if type(element) is not str else element)
-
-            if signature:
-                signatures.append(signature)
-
-        return signatures
-
-    def find_elements_until_tag(
-            start_element: PageElement,
-            tag_filter: t.Union[t.Tuple[str, ...], t.Callable[[Tag], bool]],
-            *,
-            func: BS4FindManyMethod,
-            limit: int = None,
-    ) -> t.Optional[str]:
-        """
-        Get all tags from a bs4 find many method until a tag matching `tag_filter` is found.
-
-        `tag_filter` can be either a tuple of string names to check against,
-        or a filtering t.Callable that's applied to the tags.
-        """
-        elements = []
-        for element in func(start_element, limit=limit):
-            if isinstance(tag_filter, tuple):
-                if element.name in tag_filter:
-                    break
-            elif tag_filter(element):
-                break
-            elements.append(element)
-
-        return elements
-
-    find_next_children_until_tag = staticmethod(functools.partial(find_elements_until_tag, func=functools.partial(BeautifulSoup.find_all, recursive=False)))
-    find_previous_children_until_tag = staticmethod(functools.partial(find_elements_until_tag, func=BeautifulSoup.find_all_previous))
-    find_next_siblings_until_tag = staticmethod(functools.partial(find_elements_until_tag, func=BeautifulSoup.find_next_siblings))
-    find_previous_siblings_until_tag = staticmethod(functools.partial(find_elements_until_tag, func=BeautifulSoup.find_previous_siblings))
-    find_elements_until_tag = staticmethod(find_elements_until_tag)
-
-    @async_cache(arg_offset=1)
-    async def _get_soup_from_url(self, url: str) -> BeautifulSoup:
-        """Create a BeautifulSoup object from the HTML data in `url` with the head tag removed."""
-        log.trace(f"Sending a request to {url}.")
-        async with self.bot.http_session.get(url) as response:
-            soup = BeautifulSoup(await response.text(encoding="utf8"), 'lxml')
-        soup.find("head").decompose()  # the head contains no useful data so we can remove it
-        return soup
-
     @commands.group(name='docs', aliases=('doc', 'd'), invoke_without_command=True)
-    async def docs_group(self, ctx: commands.Context, *, symbol: t.Optional[str]) -> None:
+    async def docs_group(self, ctx: commands.Context, *, symbol: Optional[str]) -> None:
         """Lookup documentation for Python symbols."""
         await ctx.invoke(self.get_command, symbol=symbol)
 
+    @commands.command()
+    async def command(self, ctx):
+        for symbol in ["arcade", "arcade"]:
+                               await self.get_command(ctx, symbol=symbol)
+
     @docs_group.command(name='getdoc', aliases=('g',))
-    async def get_command(self, ctx: commands.Context, *, symbol: t.Optional[str]) -> None:
+    async def get_command(self, ctx: commands.Context, *, symbol: Optional[str]) -> None:
         """
         Return a documentation embed for a given symbol.
 
@@ -554,7 +428,7 @@ class Doc(commands.Cog):
         )
         await ctx.send(embed=embed)
 
-    async def _fetch_inventory(self, inventory_url: str) -> t.Optional[dict]:
+    async def _fetch_inventory(self, inventory_url: str) -> Optional[dict]:
         """Get and return inventory from `inventory_url`. If fetching fails, return None."""
         fetch_func = functools.partial(intersphinx.fetch_inventory, SPHINX_MOCK_APP, '', inventory_url)
         for retry in range(1, FAILED_REQUEST_RETRY_AMOUNT+1):
@@ -580,17 +454,3 @@ class Doc(commands.Cog):
                 return package
         log.error(f"Fetching of inventory {inventory_url} failed.")
         return None
-
-    @staticmethod
-    def _match_end_tag(tag: Tag) -> bool:
-        """Matches `tag` if its class value is in `SEARCH_END_TAG_ATTRS` or the tag is table."""
-        for attr in SEARCH_END_TAG_ATTRS:
-            if attr in tag.get("class", ()):
-                return True
-
-        return tag.name == "table"
-
-
-def setup(bot: Bot) -> None:
-    """Load the Doc cog."""
-    bot.add_cog(Doc(bot))
